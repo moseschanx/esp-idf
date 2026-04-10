@@ -50,11 +50,11 @@
 #define EXAMPLE_TX_STRING           ("CDC test string!")
 #define EXAMPLE_TX_TIMEOUT_MS       (1000)
 
-#define GATTS_TABLE_TAG  "GATTS_SPP_DEMO"
+#define GATTS_TABLE_TAG  "VISPEK_SPP_TRANCEIVER_GATTS"
 #define SPP_PROFILE_NUM             1
 #define SPP_PROFILE_APP_IDX         0
 #define ESP_SPP_APP_ID              0x56
-#define SAMPLE_DEVICE_NAME          "VISPK_SPP_DEMO"    //The Device Name Characteristics in GAP
+#define SAMPLE_DEVICE_NAME          "VISPEK_MSLM_BRIDGE"    //The Device Name Characteristics in GAP
 #define SPP_SVC_INST_ID	            0
 
 /***************************************/
@@ -63,6 +63,7 @@
 
 static const char *TAG = "USB-CDC";
 static SemaphoreHandle_t device_disconnected_sem;
+static cdc_acm_dev_hdl_t cdc_dev = NULL;
 
 /***************************************/
 /*            ESP-BLE-CONFIGS           */
@@ -89,6 +90,7 @@ static SemaphoreHandle_t device_disconnected_sem;
 #define SPP_CMD_MAX_LEN            (20)
 #define SPP_STATUS_MAX_LEN         (20)
 #define SPP_DATA_BUFF_MAX_LEN      (2*1024)
+#define USB_TO_BLE_CHUNK_SIZE      (20)
 
 /***************************************/
 /*            ESP-BLE-PRIV-DEFS         */
@@ -122,13 +124,13 @@ enum{
 /// SPP Service
 static const uint16_t spp_service_uuid = 0xABFF;
 
-static const uint8_t spp_adv_data[24] = {
+static const uint8_t spp_adv_data[] = {
     /* Flags */
     0x02, ESP_BLE_AD_TYPE_FLAG, 0x06,
     /* Complete List of 16-bit Service Class UUIDs */
     0x03, ESP_BLE_AD_TYPE_16SRV_CMPL, 0xF0, 0xAB,
     /* Complete Local Name in advertising */
-    0x10, ESP_BLE_AD_TYPE_NAME_CMPL, 'V', 'I', 'S', 'P', 'E', 'K', '_', 'S', 'P', 'P', '_', 'D', 'E','M', 'O', 
+    0x10, ESP_BLE_AD_TYPE_NAME_CMPL, 'V', 'I', 'S', 'P', 'E', 'K', '_', 'M', 'S', 'L', 'M', '_', 'B', 'D', 'G', 
 };
 
 static uint16_t spp_mtu_size = SPP_GATT_MTU_SIZE;
@@ -267,6 +269,28 @@ static bool handle_rx(const uint8_t *data, size_t data_len, void *arg)
 {
     ESP_LOGI(TAG, "Data received");
     ESP_LOG_BUFFER_HEXDUMP(TAG, data, data_len, ESP_LOG_INFO);
+
+    // Forward USB payload in fixed 20-byte BLE indication chunks.
+    size_t total_chunks = (data_len + USB_TO_BLE_CHUNK_SIZE - 1) / USB_TO_BLE_CHUNK_SIZE;
+    for (size_t offset = 0; offset < data_len; offset += USB_TO_BLE_CHUNK_SIZE) {
+        uint8_t chunk[USB_TO_BLE_CHUNK_SIZE] = {0};
+        size_t remain = data_len - offset;
+        size_t copy_len = (remain >= USB_TO_BLE_CHUNK_SIZE) ? USB_TO_BLE_CHUNK_SIZE : remain;
+        size_t chunk_index = (offset / USB_TO_BLE_CHUNK_SIZE) + 1;
+
+        memcpy(chunk, data + offset, copy_len);
+        ESP_LOGI(TAG, "BLE send chunk %u/%u, payload=%u, ble_len=%u",
+                 (unsigned)chunk_index,
+                 (unsigned)total_chunks,
+                 (unsigned)copy_len,
+                 (unsigned)USB_TO_BLE_CHUNK_SIZE);
+        esp_ble_gatts_send_indicate(spp_gatts_if,
+                                    spp_conn_id,
+                                    spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL],
+                                    USB_TO_BLE_CHUNK_SIZE,
+                                    chunk,
+                                    true);
+    }
     return true;
 }
 
@@ -724,8 +748,8 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
        	break;
     	case ESP_GATTS_WRITE_EVT: {
             ESP_LOGI(GATTS_TABLE_TAG, "Characteristic write, conn_id %d, handle %d, length %d data %x", param->write.conn_id, param->write.handle, param->write.len, param->write.value[0]);
-            esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], param->write.len, param->write.value, true);
-
+            // esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], param->write.len, param->write.value, true);
+            ESP_ERROR_CHECK(cdc_acm_host_data_tx_blocking(cdc_dev, (const uint8_t *)param->write.value, param->write.len, EXAMPLE_TX_TIMEOUT_MS));
     	    res = find_char_and_desr_index(p_data->write.handle);
             if (p_data->write.is_prep == false) {
                 if (res == SPP_IDX_SPP_COMMAND_VAL) {
@@ -985,50 +1009,13 @@ void app_main(void)
     };
 
     while (true) {
-        cdc_acm_dev_hdl_t cdc_dev = NULL;
 
-        // Open USB device from tusb_serial_device example example. Either single or dual port configuration.
         ESP_LOGI(TAG, "Opening CDC ACM device 0x%04X:0x%04X...", EXAMPLE_USB_DEVICE_VID, EXAMPLE_USB_DEVICE_PID);
         esp_err_t err = cdc_acm_host_open(EXAMPLE_USB_DEVICE_VID, EXAMPLE_USB_DEVICE_PID, 0, &dev_config, &cdc_dev);
-        if (ESP_OK != err) {
-            ESP_LOGI(TAG, "Opening CDC ACM device 0x%04X:0x%04X...", EXAMPLE_USB_DEVICE_VID, EXAMPLE_USB_DEVICE_DUAL_PID);
-            err = cdc_acm_host_open(EXAMPLE_USB_DEVICE_VID, EXAMPLE_USB_DEVICE_DUAL_PID, 0, &dev_config, &cdc_dev);
-            if (ESP_OK != err) {
-                ESP_LOGI(TAG, "Failed to open device");
-                continue;
-            }
-        }
+
         cdc_acm_host_desc_print(cdc_dev);
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        // Test sending and receiving: responses are handled in handle_rx callback
-        ESP_ERROR_CHECK(cdc_acm_host_data_tx_blocking(cdc_dev, (const uint8_t *)EXAMPLE_TX_STRING, strlen(EXAMPLE_TX_STRING), EXAMPLE_TX_TIMEOUT_MS));
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-        // Test Line Coding commands: Get current line coding, change it 9600 7N1 and read again
-        ESP_LOGI(TAG, "Setting up line coding");
-
-        cdc_acm_line_coding_t line_coding;
-        ESP_ERROR_CHECK(cdc_acm_host_line_coding_get(cdc_dev, &line_coding));
-        ESP_LOGI(TAG, "Line Get: Rate: %"PRIu32", Stop bits: %"PRIu8", Parity: %"PRIu8", Databits: %"PRIu8"",
-                 line_coding.dwDTERate, line_coding.bCharFormat, line_coding.bParityType, line_coding.bDataBits);
-
-        line_coding.dwDTERate = 9600;
-        line_coding.bDataBits = 7;
-        line_coding.bParityType = 1;
-        line_coding.bCharFormat = 1;
-        ESP_ERROR_CHECK(cdc_acm_host_line_coding_set(cdc_dev, &line_coding));
-        ESP_LOGI(TAG, "Line Set: Rate: %"PRIu32", Stop bits: %"PRIu8", Parity: %"PRIu8", Databits: %"PRIu8"",
-                 line_coding.dwDTERate, line_coding.bCharFormat, line_coding.bParityType, line_coding.bDataBits);
-
-        ESP_ERROR_CHECK(cdc_acm_host_line_coding_get(cdc_dev, &line_coding));
-        ESP_LOGI(TAG, "Line Get: Rate: %"PRIu32", Stop bits: %"PRIu8", Parity: %"PRIu8", Databits: %"PRIu8"",
-                 line_coding.dwDTERate, line_coding.bCharFormat, line_coding.bParityType, line_coding.bDataBits);
-
-        ESP_ERROR_CHECK(cdc_acm_host_set_control_line_state(cdc_dev, true, false));
-
-        // We are done. Wait for device disconnection and start over
-        ESP_LOGI(TAG, "Example finished successfully! You can reconnect the device to run again.");
         xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
     }
 }
