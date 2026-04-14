@@ -62,6 +62,7 @@
 /***************************************/
 
 static const char *TAG = "USB-CDC";
+static const char *TAG_CB = "USB-CDC-CB";
 static SemaphoreHandle_t device_disconnected_sem;
 static cdc_acm_dev_hdl_t cdc_dev = NULL;
 
@@ -91,6 +92,9 @@ static cdc_acm_dev_hdl_t cdc_dev = NULL;
 #define SPP_STATUS_MAX_LEN         (20)
 #define SPP_DATA_BUFF_MAX_LEN      (2*1024)
 #define USB_TO_BLE_CHUNK_SIZE      (20)
+#define BLE_TX_QUEUE_LEN           (32)
+#define BLE_IND_ACK_TIMEOUT_MS     (300)
+#define BLE_RETRY_DELAY_MS         (10)
 
 /***************************************/
 /*            ESP-BLE-PRIV-DEFS         */
@@ -149,6 +153,15 @@ static uint8_t heartbeat_count_num = 0;
 static bool enable_data_ntf = false;
 static bool is_connected = false;
 static esp_bd_addr_t spp_remote_bda = {0x0,};
+
+typedef struct {
+    uint16_t len;
+    uint8_t data[USB_TO_BLE_CHUNK_SIZE];
+} ble_tx_item_t;
+
+static QueueHandle_t ble_tx_queue = NULL;
+static SemaphoreHandle_t ble_ind_ack_sem = NULL;
+static volatile esp_gatt_status_t ble_last_conf_status = ESP_GATT_OK;
 
 static uint16_t spp_handle_table[SPP_IDX_NB];
 
@@ -267,31 +280,69 @@ static const uint8_t  spp_heart_beat_ccc[2] = {0x00, 0x00};
  */
 static bool handle_rx(const uint8_t *data, size_t data_len, void *arg)
 {
-    ESP_LOGI(TAG, "Data received");
-    ESP_LOG_BUFFER_HEXDUMP(TAG, data, data_len, ESP_LOG_INFO);
+    if (!is_connected || !enable_data_ntf || ble_tx_queue == NULL) {
+        ESP_LOGD(TAG_CB, "Data received but not forwarding (connected=%d, ntf=%d)", is_connected, enable_data_ntf);
+        return true;
+    }
 
     // Forward USB payload in fixed 20-byte BLE indication chunks.
+    // NOTE: Keep this callback as fast as possible - slow logging here causes
+    // the USB host to miss subsequent IN transfers from the sensor (STM32 VCP
+    // drops packets when CDC_Transmit returns USBD_BUSY).
     size_t total_chunks = (data_len + USB_TO_BLE_CHUNK_SIZE - 1) / USB_TO_BLE_CHUNK_SIZE;
     for (size_t offset = 0; offset < data_len; offset += USB_TO_BLE_CHUNK_SIZE) {
-        uint8_t chunk[USB_TO_BLE_CHUNK_SIZE] = {0};
+        ble_tx_item_t item = {0};
         size_t remain = data_len - offset;
         size_t copy_len = (remain >= USB_TO_BLE_CHUNK_SIZE) ? USB_TO_BLE_CHUNK_SIZE : remain;
-        size_t chunk_index = (offset / USB_TO_BLE_CHUNK_SIZE) + 1;
 
-        memcpy(chunk, data + offset, copy_len);
-        ESP_LOGI(TAG, "BLE send chunk %u/%u, payload=%u, ble_len=%u",
-                 (unsigned)chunk_index,
-                 (unsigned)total_chunks,
-                 (unsigned)copy_len,
-                 (unsigned)USB_TO_BLE_CHUNK_SIZE);
-        esp_ble_gatts_send_indicate(spp_gatts_if,
-                                    spp_conn_id,
-                                    spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL],
-                                    USB_TO_BLE_CHUNK_SIZE,
-                                    chunk,
-                                    true);
+        item.len = USB_TO_BLE_CHUNK_SIZE;
+        memcpy(item.data, data + offset, copy_len);
+
+        if (xQueueSend(ble_tx_queue, &item, 0) != pdTRUE) {
+            ESP_LOGW(TAG_CB, "BLE TX queue full");
+        }
     }
+
+    ESP_LOGI(TAG_CB, "USB RX %u bytes -> %u BLE chunks enqueued", (unsigned)data_len, (unsigned)total_chunks);
+    // ESP_LOG_BUFFER_HEXDUMP(TAG_CB, data, data_len, ESP_LOG_INFO);
     return true;
+}
+
+static void ble_tx_task(void *arg)
+{
+    ble_tx_item_t item;
+
+    while (1) {
+        if (xQueueReceive(ble_tx_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        while (is_connected && enable_data_ntf) {
+            esp_err_t err = esp_ble_gatts_send_indicate(spp_gatts_if,
+                                                        spp_conn_id,
+                                                        spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL],
+                                                        item.len,
+                                                        item.data,
+                                                        true);
+            if (err == ESP_OK) {
+                if (xSemaphoreTake(ble_ind_ack_sem, pdMS_TO_TICKS(BLE_IND_ACK_TIMEOUT_MS)) == pdTRUE) {
+                    if (ble_last_conf_status == ESP_GATT_OK) {
+                        break;
+                    }
+                    ESP_LOGW(TAG_CB, "Indication NACK status=%d, retry", ble_last_conf_status);
+                } else {
+                    ESP_LOGW(TAG_CB, "Indication ACK timeout, retry");
+                }
+            } else if (err == ESP_GATT_BUSY || err == ESP_GATT_CONGESTED) {
+                ESP_LOGW(TAG_CB, "BLE busy/congested (%d), retry", err);
+            } else {
+                ESP_LOGE(TAG_CB, "send_indicate failed err=%d, drop", err);
+                break;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(BLE_RETRY_DELAY_MS));
+        }
+    }
 }
 
 
@@ -747,66 +798,36 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             ESP_LOGI(GATTS_TABLE_TAG, "Characteristic read abcd");
        	break;
     	case ESP_GATTS_WRITE_EVT: {
-            ESP_LOGI(GATTS_TABLE_TAG, "Characteristic write, conn_id %d, handle %d, length %d data %x", param->write.conn_id, param->write.handle, param->write.len, param->write.value[0]);
-            // esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], param->write.len, param->write.value, true);
-            ESP_ERROR_CHECK(cdc_acm_host_data_tx_blocking(cdc_dev, (const uint8_t *)param->write.value, param->write.len, EXAMPLE_TX_TIMEOUT_MS));
-    	    res = find_char_and_desr_index(p_data->write.handle);
-            if (p_data->write.is_prep == false) {
-                if (res == SPP_IDX_SPP_COMMAND_VAL) {
-                    uint8_t * spp_cmd_buff = NULL;
-                    spp_cmd_buff = (uint8_t *)malloc((spp_mtu_size - 3) * sizeof(uint8_t));
-                    if(spp_cmd_buff == NULL){
-                        ESP_LOGE(GATTS_TABLE_TAG, "%s malloc failed", __func__);
-                        break;
-                    }
-                    memset(spp_cmd_buff, 0x0, (spp_mtu_size - 3));
-                    memcpy(spp_cmd_buff, p_data->write.value, p_data->write.len);
-                    xQueueSend(cmd_cmd_queue, &spp_cmd_buff, 10/portTICK_PERIOD_MS);
-                } else if (res == SPP_IDX_SPP_DATA_NTF_CFG) {
-                    if ((p_data->write.len == 2) && (p_data->write.value[0] == 0x01) && (p_data->write.value[1] == 0x00)) {
-                        ESP_LOGI(GATTS_TABLE_TAG, "SPP data notification enable");
+            // ESP_LOGI(GATTS_TABLE_TAG, "Characteristic write, conn_id %d, handle %d, length %d data %x", param->write.conn_id, param->write.handle, param->write.len, param->write.value[0]);
+            ESP_LOGI(GATTS_TABLE_TAG, "Characteristic write, conn_id %d, handle %d, length %d", param->write.conn_id, param->write.handle, param->write.len);
+
+                uint8_t idx = find_char_and_desr_index(param->write.handle);
+                if (idx == SPP_IDX_SPP_DATA_NTF_CFG && param->write.len == 2) {
+                    uint16_t descr_value = (uint16_t)(param->write.value[1] << 8) | param->write.value[0];
+                    if (descr_value == 0x0002) {
                         enable_data_ntf = true;
-                    } else if ((p_data->write.len == 2) && (p_data->write.value[0] == 0x02) && (p_data->write.value[1] == 0x00)) {
                         ESP_LOGI(GATTS_TABLE_TAG, "SPP data indication enable");
-                        enable_data_ntf = true;
-                    } else if ((p_data->write.len == 2) && (p_data->write.value[0] == 0x00) && (p_data->write.value[1] == 0x00)) {
-                        ESP_LOGI(GATTS_TABLE_TAG, "SPP data notification/indication disable");
+                    } else {
                         enable_data_ntf = false;
+                        ESP_LOGI(GATTS_TABLE_TAG, "SPP data indication disable");
                     }
-                } else if (res == SPP_IDX_SPP_STATUS_CFG) {
-                    if ((p_data->write.len == 2) && (p_data->write.value[0] == 0x01) && (p_data->write.value[1] == 0x00)) {
-                        ESP_LOGI(GATTS_TABLE_TAG, "SPP status notification enable");
-                    } else if ((p_data->write.len == 2) && (p_data->write.value[0] == 0x00) && (p_data->write.value[1] == 0x00)) {
-                        ESP_LOGI(GATTS_TABLE_TAG, "SPP status notification disable");
+                    break;
+                }
+
+                if (idx == SPP_IDX_SPP_DATA_RECV_VAL) {
+                    if (cdc_dev != NULL) {
+                        esp_err_t tx_err = cdc_acm_host_data_tx_blocking(cdc_dev,
+                                                                          (const uint8_t *)param->write.value,
+                                                                          param->write.len,
+                                                                          EXAMPLE_TX_TIMEOUT_MS);
+                        if (tx_err != ESP_OK) {
+                            ESP_LOGE(GATTS_TABLE_TAG, "CDC TX failed: %s", esp_err_to_name(tx_err));
+                        }
+                    } else {
+                        ESP_LOGW(GATTS_TABLE_TAG, "CDC device not open, ignore BLE write payload");
                     }
                 }
-#ifdef SUPPORT_HEARTBEAT
-                else if (res == SPP_IDX_SPP_HEARTBEAT_CFG) {
-                    if ((p_data->write.len == 2) && (p_data->write.value[0] == 0x01) && (p_data->write.value[1] == 0x00)) {
-                        ESP_LOGI(GATTS_TABLE_TAG, "SPP heartbeat notification enable");
-                        enable_heart_ntf = true;
-                    } else if ((p_data->write.len == 2) && (p_data->write.value[0] == 0x00) && (p_data->write.value[1] == 0x00)) {
-                        ESP_LOGI(GATTS_TABLE_TAG, "SPP heartbeat notification disable");
-                        enable_heart_ntf = false;
-                    }
-                } else if (res == SPP_IDX_SPP_HEARTBEAT_VAL) {
-                    if ((p_data->write.len == sizeof(heartbeat_s)) && (memcmp(heartbeat_s, p_data->write.value, sizeof(heartbeat_s)) == 0)) {
-                        heartbeat_count_num = 0;
-                    }
-                }
-#endif
-                else if (res == SPP_IDX_SPP_DATA_RECV_VAL) {
-#ifdef CONFIG_EXAMPLE_ENABLE_RF_EMC_TEST_MODE
-                    ESP_LOG_BUFFER_HEX("RX", p_data->write.value, p_data->write.len);
-#else
-                    uart_write_bytes(UART_NUM_0, (char *)(p_data->write.value), p_data->write.len);
-#endif
-                } else {
-                    //TODO:
-                }
-            } else if ((p_data->write.is_prep == true) && (res == SPP_IDX_SPP_DATA_RECV_VAL)) {
-                store_wr_buffer(p_data);
-            }
+    	   
       	 	break;
     	}
     	case ESP_GATTS_EXEC_WRITE_EVT: {
@@ -824,9 +845,13 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
     	    spp_mtu_size = p_data->mtu.mtu;
     	    break;
     	case ESP_GATTS_CONF_EVT:
+            ble_last_conf_status = param->conf.status;
             if (param->conf.status) {
-                ESP_LOGI(GATTS_TABLE_TAG, "Confirm received, status %d, handle %d", param->conf.status, param->conf.handle);
+                ESP_LOGW(GATTS_TABLE_TAG, "Confirm received, status %d, handle %d", param->conf.status, param->conf.handle);
             }
+	        if (ble_ind_ack_sem != NULL) {
+	            xSemaphoreGive(ble_ind_ack_sem);
+	        }
     	    break;
     	case ESP_GATTS_UNREG_EVT:
         	break;
@@ -931,6 +956,12 @@ void app_main(void)
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
 
     spp_task_init();
+
+    ble_tx_queue = xQueueCreate(BLE_TX_QUEUE_LEN, sizeof(ble_tx_item_t));
+    ble_ind_ack_sem = xSemaphoreCreateBinary();
+    assert(ble_tx_queue);
+    assert(ble_ind_ack_sem);
+    xTaskCreate(ble_tx_task, "ble_tx_task", 4096, NULL, 10, NULL);
 
     // Initialize NVS
     ret = nvs_flash_init();
